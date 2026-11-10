@@ -1,0 +1,244 @@
+name: Rent RK native Linux component QA
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-linux:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      ARCHIVE_COMMIT: ac36342a3ec14e9ce78e5df190ce56a3eb66f539
+      ARCHIVE_SHA256: 5c140f49d69923ce739fd0ed1876e03fd448911763cd715b067678c1f8e9f434
+    steps:
+      - name: Initialize evidence directory
+        id: init
+        shell: bash
+        run: |
+          umask 077
+          root="$(mktemp -d "$RUNNER_TEMP/rent-rk-native-XXXXXXXX")"
+          mkdir "$root/lab" "$root/evidence"
+          printf 'QA=NOT_RUN\n' > "$root/evidence/status.txt"
+          printf 'root=%s\n' "$root" >> "$GITHUB_OUTPUT"
+
+      - name: Check out only the frozen archive revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ac36342a3ec14e9ce78e5df190ce56a3eb66f539
+          persist-credentials: false
+          fetch-depth: 1
+          path: frozen
+
+      - name: Verify archive and build Linux tools (network allowed)
+        env:
+          ROOT: ${{ steps.init.outputs.root }}
+        shell: bash
+        run: |
+          trap 'rc=$?; printf "QA=NOT_RUN\npreparation_exit=%s\n" "$rc" > "$ROOT/evidence/status.txt"' EXIT
+          test "$(git -C frozen rev-parse HEAD)" = "$ARCHIVE_COMMIT"
+          test "$(git -C frozen ls-tree -r --name-only HEAD)" = PHP_CUTOVER_NATIVE_UNIX_CODE_ONLY.zip
+          archive="$GITHUB_WORKSPACE/frozen/PHP_CUTOVER_NATIVE_UNIX_CODE_ONLY.zip"
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$archive" | sha256sum --check
+          cp -- "$archive" "$ROOT/input.zip"
+          chmod 444 "$ROOT/input.zip"
+          printf 'archive_commit=%s\narchive_sha256=%s\nworkflow_commit=%s\nrun_id=%s\nattempt=%s\n' \
+            "$ARCHIVE_COMMIT" "$ARCHIVE_SHA256" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            > "$ROOT/evidence/binding.txt"
+          mkdir "$ROOT/empty-context"
+          docker build --platform linux/amd64 --tag rent-rk-native:local -f - "$ROOT/empty-context" \
+            > "$ROOT/evidence/tools-build.log" 2>&1 <<'DOCKER'
+          FROM docker.io/library/node:22-trixie-slim@sha256:8658a93ea0778be81c513e04eba758202973b91f8c83144f5a41efbb5d2bf0a9
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              php8.4-cli php8.4-common php8.4-xml php8.4-mbstring python3 iproute2 \
+              && ln -s /usr/local/bin/node /usr/bin/node \
+              && rm -rf /var/lib/apt/lists/*
+          DOCKER
+          docker image inspect --format '{{.Id}}' rent-rk-native:local > "$ROOT/evidence/image-id.txt"
+
+      - name: Run UNIX_RUN.md scenario in a loopback-only Linux container
+        id: native
+        env:
+          ROOT: ${{ steps.init.outputs.root }}
+        shell: bash
+        run: |
+          set +e
+          docker run --rm -i --pull=never --platform linux/amd64 --network none \
+            --cap-drop ALL --security-opt no-new-privileges --read-only \
+            --user "$(id -u):$(id -g)" --workdir /lab \
+            --mount "type=bind,src=$ROOT/input.zip,dst=/approved-transfer/PHP_CUTOVER_NATIVE_UNIX_CODE_ONLY.zip,readonly" \
+            --mount "type=bind,src=$ROOT/lab,dst=/lab" \
+            --entrypoint /usr/bin/env rent-rk-native:local -i \
+            PATH=/usr/local/bin:/usr/bin:/bin HOME=/lab/home LANG=C.UTF-8 \
+            TMPDIR=/lab/tmp TMP=/lab/tmp TEMP=/lab/tmp ARCHIVE_SHA256="$ARCHIVE_SHA256" \
+            /bin/bash -euo pipefail -s > "$ROOT/lab/container.log" 2>&1 <<'OFFLINE'
+          umask 077
+          mkdir "$HOME" "$TMPDIR"
+          {
+            test "$(id -u)" -ne 0
+            test "$(find /sys/class/net -mindepth 1 -maxdepth 1 -printf '%f\n')" = lo
+            test "$(ip -o -4 addr show dev lo | awk '{print $4}')" = 127.0.0.1/8
+            test -z "$(ip -4 route show table main)"
+            test -z "$(ip -6 route show table main)"
+            grep -Eq '^CapEff:[[:space:]]+0+$' /proc/self/status
+            grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
+            ip -brief addr show
+            uname -srm
+            cat /etc/debian_version
+            fs_type="$(findmnt -n -o FSTYPE --target "$TMPDIR")"
+            printf 'filesystem=%s\n' "$fs_type"
+            case "$fs_type" in ext4|xfs) ;; *) exit 1 ;; esac
+            php -v
+            sha256sum /usr/bin/php
+            php -r 'if (PHP_OS_FAMILY !== "Linux" || PHP_SAPI !== "cli" || PHP_MAJOR_VERSION !== 8 || PHP_MINOR_VERSION !== 4) exit(1); foreach (["sodium", "dom", "mbstring", "fileinfo"] as $e) { if (!extension_loaded($e)) { fwrite(STDERR, "Missing extension: $e\n"); exit(1); } echo "$e\n"; }'
+            node --version
+            node -e 'if (process.platform !== "linux" || Number(process.versions.node.split(".")[0]) < 22) process.exit(1)'
+            python3 --version
+          } > /lab/environment.txt
+          python3 - <<'PY' >> /lab/environment.txt
+          import fcntl, os, socket, tempfile
+          with socket.socket() as local:
+              local.bind(('127.0.0.1', 0))
+              local.listen()
+              with socket.create_connection(local.getsockname(), timeout=2):
+                  with local.accept()[0]:
+                      pass
+          with tempfile.TemporaryDirectory() as directory:
+              a, b = (os.path.join(directory, name) for name in ('a', 'b'))
+              with open(a, 'w') as one, open(a, 'r') as two:
+                  fcntl.flock(one, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                  try:
+                      fcntl.flock(two, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                  except BlockingIOError:
+                      pass
+                  else:
+                      raise SystemExit('exclusive flock was not enforced')
+                  one.write('probe')
+                  one.flush()
+                  os.fsync(one.fileno())
+                  os.replace(a, b)
+              with open(b) as observed:
+                  if observed.read() != 'probe':
+                      raise SystemExit('rename probe mismatch')
+          print('loopback, flock, fsync and same-directory rename: OK')
+          PY
+          archive=/approved-transfer/PHP_CUTOVER_NATIVE_UNIX_CODE_ONLY.zip
+          printf '%s  %s\n' "$ARCHIVE_SHA256" "$archive" | sha256sum --check
+          owner="$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="rent-rk-b24-code-only-"))')"
+          python3 - "$archive" <<'PY'
+          import hashlib, json, stat, sys, zipfile
+          from pathlib import PurePosixPath
+          def require(ok, reason):
+              if not ok:
+                  raise SystemExit(reason)
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              names = set(z.namelist())
+              require(len(names) == len(z.infolist()), 'duplicate ZIP paths')
+              for info in z.infolist():
+                  p = PurePosixPath(info.filename)
+                  require(not p.is_absolute() and '..' not in p.parts and '\\' not in info.filename
+                          and not stat.S_ISLNK(info.external_attr >> 16) and not info.is_dir(), 'unsafe ZIP entry')
+              require(z.testzip() is None, 'CRC mismatch')
+              index = json.loads(z.read('INDEX.json'))['files']
+              require(len(index) == len(names) - 1 and {e['path'] for e in index} == names - {'INDEX.json'},
+                      'index membership mismatch')
+              def check(prefix, entry):
+                  data = z.read(prefix + entry['path'])
+                  require(len(data) == entry['bytes'] and sha(data) == entry['sha256'], 'manifest byte mismatch')
+              for entry in index:
+                  check('', entry)
+              manifest = json.loads(z.read('qa/series-1/manifest.json'))['files']
+              require({e['path'] for e in manifest} == {p[5:] for p in names if p.startswith('code/')}
+                      and len(manifest) == 314, 'code manifest membership mismatch')
+              for entry in manifest:
+                  check('code/', entry)
+              qa = json.loads(z.read('qa/series-1/qa-before.json'))
+              require(set(qa) == {p[3:] for p in names if p.startswith('qa/') and p.count('/') == 1},
+                      'QA manifest membership mismatch')
+              for name, expected in qa.items():
+                  require(sha(z.read('qa/' + name)) == expected, 'QA manifest byte mismatch')
+              print(f'ZIP CRC and manifests: {len(index)} indexed, {len(manifest)} code, {len(qa)} QA')
+          PY
+          python3 -m zipfile -t "$archive"
+          python3 -m zipfile -e "$archive" "$owner"
+          test "$(findmnt -n -o FSTYPE --target "$owner")" = "$fs_type"
+          mkdir -p "$owner/code/data" "$owner/code/tmp/business-data-audit"
+          printf '%s\n' "$owner" > /lab/qa-owner
+          printf 'QA=STARTED\n' > /lab/qa-status
+          set +e
+          RENT_RK_UNIX_QA_PHP=/usr/bin/php timeout --kill-after=10s 16m \
+            node "$owner/qa/run.cjs" "$owner/code" series-1
+          rc=$?
+          set -e
+          printf 'QA=FINISHED\nqa_exit=%s\n' "$rc" > /lab/qa-status
+          exit "$rc"
+          OFFLINE
+          rc=$?
+          set -e
+          if [[ -f "$ROOT/lab/qa-status" ]]; then
+            cp -- "$ROOT/lab/qa-status" "$ROOT/evidence/status.txt"
+          fi
+          printf 'container_exit=%s\n' "$rc" >> "$ROOT/evidence/status.txt"
+          exit "$rc"
+
+      - name: Select Linux evidence and compute SHA-256
+        if: always() && steps.init.outcome == 'success'
+        env:
+          ROOT: ${{ steps.init.outputs.root }}
+          RUN_OUTCOME: ${{ steps.native.outcome }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, stat
+          from pathlib import Path
+          root = Path(os.environ['ROOT'])
+          lab, out = root / 'lab', root / 'evidence'
+          sensitive = re.compile(
+              rb'-----BEGIN [A-Z ]*PRIVATE KEY-----|PHPSESSID[=;]|'
+              rb'"(?:cookie|set-cookie|sessionId|session_id|csrf_token|privateKey|password)"\s*:\s*"[^"]+"', re.I)
+          allowed = ('primary.json', 'failure.json', 'freeze-at-launch.json', 'freeze-after-main.json',
+                     'isolation.json', 'preservation.json', 'lab-ownership.json', 'baseline-binding.json')
+          def copy(p, target=None):
+              if not p.exists() and not p.is_symlink():
+                  return
+              if not stat.S_ISREG(p.lstat().st_mode) or p.resolve() != p or p.stat().st_size > 4_000_000:
+                  raise SystemExit(f'rejected evidence file: {p.name}')
+              data = p.read_bytes()
+              if sensitive.search(data):
+                  raise SystemExit(f'rejected sensitive-looking evidence: {p.name}')
+              (out / (target or p.name)).write_bytes(data)
+          try:
+              for name in ('environment.txt', 'container.log', 'qa-status'):
+                  copy(lab / name)
+              owner_file = lab / 'qa-owner'
+              if owner_file.is_file():
+                  owner = owner_file.read_text().strip().removeprefix('/lab/tmp/')
+                  if not re.fullmatch(r'rent-rk-b24-code-only-[a-z0-9_]+', owner):
+                      raise SystemExit('unrecognized QA owner directory')
+                  for name in allowed:
+                      copy(lab / 'tmp' / owner / 'qa/series-1' / name)
+              if os.environ['RUN_OUTCOME'] == 'success':
+                  primary = json.loads((out / 'primary.json').read_text())
+                  if (primary.get('platform') != 'linux' or primary.get('status') != 'PASS_COMPONENT_ONLY'
+                      or not primary.get('results') or not all(r.get('passed') for r in primary['results'])
+                      or not (out / 'freeze-after-main.json').is_file()):
+                      raise SystemExit('missing or invalid native primary/preservation evidence')
+          finally:
+              (out / 'SHA256SUMS').write_text(''.join(
+                  f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n'
+                  for p in sorted(out.iterdir()) if p.name != 'SHA256SUMS'))
+          PY
+
+      - name: Upload only selected evidence
+        if: always() && steps.init.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rent-rk-native-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.init.outputs.root }}/evidence/
+          if-no-files-found: error
+          retention-days: 7
